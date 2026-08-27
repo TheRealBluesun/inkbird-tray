@@ -1,0 +1,29 @@
+[package]
+name = "inkbird-tray"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "System tray daemon for the InkBird IAM-T1 air-quality sensor"
+license = "MIT"
+readme = "README.md"
+
+[[bin]]
+name = "inkbird-tray"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+bluer = { version = "0.17", features = ["bluetoothd"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+dirs = "5"
+futures = "0.3"
+ksni = "0.3"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,56 @@
+I'll start by reading the reference implementation, the Python prototype, and project constraints so the daemon matches the verified protocol and this desktop's tray stack.The reference tray and Python prototype match the protocol brief. Next I’ll check Paperclip assignment state and the voxtype crate versions so the Rust daemon can follow the same stack.No Paperclip env is set, so this is a standalone build. I’ll inspect adapters, icons, and crate APIs next, then scaffold the project.Default adapter is already hci0, which can reach the sensor. I’ll confirm bluer’s API and then start the project.I’ll use bluer so we can take BlueZ’s default adapter (hci0) and get native GATT notifications. Pulling the exact API next.I have the APIs I need. Next I’ll scaffold the crate and implement BLE, tray, protocol parsing, and CSV logging.The BLE cycle return type is messier than it needs to be. I’ll simplify that path, then add `main.rs`, the unit file, and the README.Source is in place. Next I’ll compile and run the protocol tests so we can fix any API mismatches.Release build succeeded. Next I’ll start the daemon against the live sensor, confirm tray registration on D-Bus, and leave it running long enough to capture a decoded packet.The daemon found the sensor, subscribed, and registered `org.kde.StatusNotifierItem-261877-1` on the session bus. I’ll wait past one sampling interval for a decoded packet.A live DATA packet already decoded (681 ppm, 74.6 °F). I’ll wait out the rest of the two-minute run for a second sample, then shut down cleanly.Two live packets landed and the CSV matches. I’ll send SIGTERM to confirm a clean disconnect, then tidy warnings.The daemon is in `~/inkbird-tray`, release-built, and verified against the live IAM-T1.
+
+## What you get
+
+A tokio service with two tasks: BLE (`scan → connect → subscribe → reconnect with backoff`) and a Cinnamon StatusNotifierItem tray (`ksni` 0.3, same pattern as voxtype). They talk over a `watch` channel so the tray never blocks the radio.
+
+BLE uses **`bluer` 0.17** (official BlueZ bindings) instead of btleplug so we take `Session::default_adapter()` — on this box that is `hci0`, the Broadcom stick that can see the sensor. Justification is in `README.md`.
+
+## Build
+
+`cargo build --release` succeeded. Binary: `target/release/inkbird-tray`.
+
+```bash
+./target/release/inkbird-tray
+```
+
+## Live run (~3 minutes on the real device)
+
+Used default adapter `hci0` (`XX:XX:XX:XX:XX:XX`), rediscovered `Ink@IAM-T1` at `XX:XX:XX:XX:XX:XX` by name/manufacturer fingerprint (MAC not hard-coded), subscribed to `ffe4`, and decoded three DATA packets:
+
+```
+DATA 55aa01101002ea027602a903da0100fd | CO2 681 ppm | 74.6 °F | 23.7 °C | RH 63.0 % | 986 hPa
+DATA 55aa01101002ea0280029b03da0100f9 | CO2 667 ppm | 74.6 °F | 23.7 °C | RH 64.0 % | 986 hPa
+DATA 55aa01101002ec0280029703da0100f7 | CO2 663 ppm | 74.8 °F | 23.8 °C | RH 64.0 % | 986 hPa
+```
+
+CSV at `~/.local/share/inkbird-tray/readings.csv`:
+
+```
+timestamp,co2_ppm,temp,unit,temp_c,humidity_pct,pressure_hpa
+2026-08-14T13:43:00,681,74.6,F,23.67,63.0,986
+2026-08-14T13:45:00,667,74.6,F,23.67,64.0,986
+2026-08-14T13:46:00,663,74.8,F,23.78,64.0,986
+```
+
+SIGTERM disconnected the sensor and exited cleanly (`shutdown: disconnecting` → `stopped`).
+
+## Tray on this session bus
+
+`xapp-sn-watcher` was already owning `org.kde.StatusNotifierWatcher`. After start:
+
+| evidence | value |
+| --- | --- |
+| log | `system tray icon started (StatusNotifierItem id=inkbird-tray)` |
+| well-known name | `org.kde.StatusNotifierItem-261877-1` owned by pid 261877 `inkbird-tray` |
+| watcher list | `RegisteredStatusNotifierItems` included `org.kde.StatusNotifierItem-261877-1/StatusNotifierItem` |
+
+After SIGTERM that name was gone. I did not visually confirm the Cinnamon icon; the registration path ran without panicking.
+
+Icons (all present in Mint-X): `weather-clear` / `weather-few-clouds` / `weather-storm` by CO₂; `view-refresh`, `bluetooth-active`, `bluetooth`, `dialog-warning`, `network-offline`, `dialog-error` for the other states.
+
+## Also shipped
+
+- `inkbird-tray.service` — `Type=simple`, `Restart=always`, `RestartSec=10`, `After=bluetooth.target`, `WantedBy=default.target`. Not installed.
+- `README.md` — build/run, protocol, tray icons, phone-app / BLE-switch troubleshooting.
+- 7 unit tests on the live-capture decode (`55aa0110…` → 73.5 °F / 61 % / 781 ppm / 986 hPa).

@@ -1,0 +1,14 @@
+[Unit]
+Description=InkBird IAM-T1 air quality tray
+After=bluetooth.target
+
+[Service]
+Type=simple
+# Point ExecStart at the release binary after `cargo build --release`.
+# Default assumes the project lives at ~/inkbird-tray.
+ExecStart=%h/inkbird-tray/target/release/inkbird-tray
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
