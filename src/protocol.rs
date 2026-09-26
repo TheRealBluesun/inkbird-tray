@@ -161,9 +161,12 @@ pub fn to_celsius(temp: f32, unit: TempUnit) -> f32 {
 }
 
 /// Until a STATE packet arrives, infer the unit from magnitude.
-/// Values above 65 are treated as Fahrenheit (device default).
+/// Values above 45 are treated as Fahrenheit (device default): no indoor
+/// room reaches 45 °C, while a cool room easily drops below 65 °F.
+pub const INFER_F_ABOVE: f32 = 45.0;
+
 pub fn infer_unit(temp: f32) -> TempUnit {
-    if temp > 65.0 {
+    if temp > INFER_F_ABOVE {
         TempUnit::Fahrenheit
     } else {
         TempUnit::Celsius

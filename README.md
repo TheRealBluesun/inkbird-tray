@@ -32,6 +32,20 @@ Header:
 timestamp,co2_ppm,temp,unit,temp_c,humidity_pct,pressure_hpa
 ```
 
+Each reading is also written to SQLite (WAL mode):
+
+```
+~/.local/share/inkbird-tray/readings.db   table readings(ts INTEGER PRIMARY KEY, …)
+```
+
+`ts` is Unix seconds; the other columns match the CSV. On first start with an
+empty database the existing CSV is imported, so history carries over.
+
+```bash
+sqlite3 ~/.local/share/inkbird-tray/readings.db \
+  "select datetime(ts,'unixepoch','localtime'), co2_ppm from readings order by ts desc limit 5"
+```
+
 Stop with Ctrl-C, SIGTERM, or the tray **Quit** item. The process disconnects
 from the sensor before exiting so the phone app can take the (single) BLE slot.
 
@@ -116,7 +130,7 @@ Verified capture `55aa01101002df0262030d03da010043` decodes to 73.5 °F,
 
 `data[10] & 0xF`: `1` = Fahrenheit, `0` = Celsius. These arrive only
 periodically (minutes). Until one is seen, the unit is inferred from magnitude
-(`temp > 65` ⇒ Fahrenheit). The tray and CSV store the raw value with its unit
+(`temp > 45` ⇒ Fahrenheit). The tray and CSV store the raw value with its unit
 **and** Celsius.
 
 Packets outside humidity 0–100 %, CO₂ ≤ 5000 ppm, pressure 300–1200 hPa, or
@@ -130,6 +144,23 @@ daemon mutually exclude each other.
 StatusNotifierItem via `ksni` 0.3, same approach as voxtype on this Cinnamon
 desktop (`assume_sni_available(true)` so a missing watcher is treated as
 temporary).
+
+### History window
+
+Left-click the icon (or **Show history…** in the menu) to open a chart of
+CO2, temperature, humidity and pressure. It runs as a separate process
+(`inkbird-tray --viewer`, egui/glow) that reads the SQLite store read-only
+and polls for new rows every 15 s; clicking again raises the open window
+(SIGUSR1).
+
+- Range presets 3h … 30d / All; **Live** keeps the right edge on the newest
+  reading.
+- Scroll zooms around the pointer, drag or shift+scroll pans, arrow keys step,
+  Esc closes. The four plots share the time axis and the hover cursor; the
+  cards show the hovered values and min/avg/max for the visible range.
+- Samples more than 10 min apart are drawn as separate segments, so sensor
+  outages show as gaps. Long ranges are reduced to a min/max pair per pixel
+  column, which keeps spikes.
 
 ### The icon IS the reading (pixmap digits)
 
@@ -230,5 +261,7 @@ src/protocol.rs   packet parser (unit-tested against the live capture)
 src/tray.rs       ksni StatusNotifierItem
 src/state.rs      watch-channel snapshot
 src/csvlog.rs     ~/.local/share/inkbird-tray/readings.csv
+src/db.rs         ~/.local/share/inkbird-tray/readings.db (SQLite)
+src/viewer.rs     history window (inkbird-tray --viewer)
 inkbird-tray.service
 ```

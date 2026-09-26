@@ -18,7 +18,7 @@ use futures::{pin_mut, StreamExt};
 use tokio::sync::watch;
 use tokio::time::{timeout, Instant};
 
-use crate::csvlog;
+use crate::{csvlog, db};
 use crate::protocol::{
     hex_lower, infer_unit, mfg_matches, name_matches, parse_packet, to_celsius, NotifyBuf, Packet,
     TempUnit, NOTIFY_UUID, SERVICE_UUID,
@@ -693,7 +693,10 @@ fn handle_payload(
                 suffix
             );
             if let Err(e) = csvlog::append(&reading) {
-                tracing::warn!("failed to persist reading: {e:#}");
+                tracing::warn!("failed to persist reading to CSV: {e:#}");
+            }
+            if let Err(e) = db::append(&reading) {
+                tracing::warn!("failed to persist reading to SQLite: {e:#}");
             }
             *saw_data = true;
             let prev = state_tx.borrow().last_reading.clone();

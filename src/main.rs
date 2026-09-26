@@ -6,10 +6,12 @@
 
 mod ble;
 mod csvlog;
+mod db;
 mod pixmap;
 mod protocol;
 mod state;
 mod tray;
+mod viewer;
 
 /// Floor for the stale window (seconds). A reading older than the effective
 /// window (this floor, widened adaptively once the device rhythm is known —
@@ -31,8 +33,15 @@ use tracing_subscriber::EnvFilter;
 use crate::state::AppState;
 use crate::tray::TrayAction;
 
+fn main() -> anyhow::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--viewer") {
+        return viewer::run();
+    }
+    daemon()
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn daemon() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -43,6 +52,14 @@ async fn main() -> anyhow::Result<()> {
 
     let csv_path = csvlog::default_path()?;
     tracing::info!("readings CSV: {}", csv_path.display());
+    match db::open().and_then(|mut conn| db::import_csv_if_empty(&mut conn, &csv_path)) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("seeded SQLite history with {n} rows from CSV"),
+        Err(e) => tracing::warn!("SQLite history unavailable: {e:#}"),
+    }
+    if let Ok(p) = db::default_path() {
+        tracing::info!("readings DB: {}", p.display());
+    }
 
     let (state_tx, state_rx) = watch::channel(AppState::default());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

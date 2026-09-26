@@ -4,6 +4,8 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use ksni::TrayMethods;
 use tokio::sync::mpsc;
@@ -38,6 +40,42 @@ pub mod icons {
 struct InkBirdTray {
     app: AppState,
     action_tx: mpsc::UnboundedSender<TrayAction>,
+    /// PID of the open history window, 0 when none. Cleared by the reaper
+    /// thread when the window exits.
+    viewer_pid: Arc<AtomicU32>,
+}
+
+/// Open the history window, or raise it (SIGUSR1) if it is already open.
+fn show_history(viewer_pid: &Arc<AtomicU32>) {
+    let pid = viewer_pid.load(Ordering::Relaxed);
+    if pid != 0 && unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) } == 0 {
+        return;
+    }
+    // After a rebuild the running binary shows up as "<path> (deleted)";
+    // launch whatever is at the path now.
+    let exe = match std::env::current_exe() {
+        Ok(p) => {
+            let s = p.to_string_lossy();
+            std::path::PathBuf::from(s.strip_suffix(" (deleted)").unwrap_or(&s))
+        }
+        Err(e) => {
+            tracing::warn!("cannot locate own executable: {e}");
+            return;
+        }
+    };
+    match Command::new(&exe).arg("--viewer").stdin(Stdio::null()).spawn() {
+        Ok(mut child) => {
+            viewer_pid.store(child.id(), Ordering::Relaxed);
+            let viewer_pid = viewer_pid.clone();
+            std::thread::spawn(move || {
+                let status = child.wait();
+                viewer_pid.store(0, Ordering::Relaxed);
+                tracing::info!("history window closed ({status:?})");
+            });
+            tracing::info!("history window opened");
+        }
+        Err(e) => tracing::warn!("failed to launch history window: {e}"),
+    }
 }
 
 impl InkBirdTray {
@@ -87,6 +125,11 @@ impl InkBirdTray {
 impl ksni::Tray for InkBirdTray {
     fn id(&self) -> String {
         "inkbird-tray".into()
+    }
+
+    /// Left click on the tray icon.
+    fn activate(&mut self, _x: i32, _y: i32) {
+        show_history(&self.viewer_pid);
     }
 
     fn category(&self) -> ksni::Category {
@@ -190,6 +233,13 @@ impl ksni::Tray for InkBirdTray {
             .into(),
             MenuItem::Separator,
             StandardItem {
+                label: "Show history…".into(),
+                icon_name: "utilities-system-monitor".into(),
+                activate: Box::new(|this: &mut Self| show_history(&this.viewer_pid)),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
                 label: "Copy latest readings".into(),
                 enabled: has_reading,
                 activate: Box::new(move |_this: &mut Self| {
@@ -255,6 +305,7 @@ pub async fn spawn_tray(
     let tray = InkBirdTray {
         app: state_rx.borrow().clone(),
         action_tx,
+        viewer_pid: Arc::new(AtomicU32::new(0)),
     };
 
     // assume_sni_available keeps the service alive when the watcher is not
