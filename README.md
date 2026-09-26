@@ -63,9 +63,13 @@ The brief suggested `btleplug` 0.12+. This daemon uses **`bluer` 0.17**
 
 - Official BlueZ D-Bus bindings, Linux-only (this project is already Linux-only
   because of StatusNotifierItem + the systemd unit).
-- `Session::default_adapter()` maps to BlueZ's default adapter (`hci0` when
-  present). On this machine `hci0` is the Broadcom BT 4.0 USB stick that can
-  reach the sensor; `hci1` is the onboard Qualcomm radio.
+- Adapter D-Bus paths (`/org/bluez/hciN`) are re-opened every scan cycle.
+  USB dongles get a new `hciN` after unplug/replug; pinning `hci0` for the
+  lifetime of the process leaves the daemon calling StartDiscovery on a
+  removed object (`the target object was either not present or removed`).
+  Preference order: `INKBIRD_TRAY_ADAPTER` (hci name or MAC), then the
+  adapter that last delivered a reading, then any adapter that already has a
+  cached `iam-t1` device, then the remaining radios.
 - Native GATT notify stream (`Characteristic::notify`) with typed BlueZ error
   kinds (`AlreadyConnected`, `Failed`, …), which makes the "device busy" state
   reliable.
@@ -190,14 +194,20 @@ link). The IAM-T1 has a single central slot. This daemon keeps retrying with
 exponential backoff (5 s … 60 s).
 
 **`not found` / scan never matches.** Pop the battery cap and check the
-physical BLE switch. It is easy to knock off when changing cells. Also confirm
-the USB BT 4.0 adapter (`hci0`) is the BlueZ default:
+physical BLE switch. It is easy to knock off when changing cells. The daemon
+scans every powered adapter; pin one with `INKBIRD_TRAY_ADAPTER` (hci name
+or MAC, e.g. `hci2` or `XX:XX:XX:XX:XX:XX`) if only the USB dongle can see
+the sensor.
+
+**`start LE discovery: the target object was either not present or removed`.**
+The USB BT dongle was re-enumerated (`hci0` → `hci2`) while the process still
+held the old adapter. Current builds re-open BlueZ every cycle; restart
+`inkbird-tray` if you are on an older binary.
 
 ```bash
 bluetoothctl list
+hciconfig -a
 ```
-
-`[default]` should be the Broadcom stick, not the onboard Qualcomm radio.
 
 **`Failed to start system tray icon`.** No session bus (`DBUS_SESSION_BUS_ADDRESS`)
 or you started the unit outside a graphical login. Run it from the desktop

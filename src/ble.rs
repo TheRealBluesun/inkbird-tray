@@ -1,12 +1,18 @@
 //! BLE scan / connect / notify / reconnect loop.
 //!
 //! Rediscover by advertisement fingerprint on every attempt. Never cache the
-//! random-static MAC. Never poll characteristics.
+//! sensor's random-static MAC. Never poll characteristics.
+//!
+//! Adapter D-Bus paths are *not* stable: a USB dongle unplug/replug moves the
+//! working radio from hci0 to hci2 and leaves `/org/bluez/hci0` as a dead
+//! object. Re-open the BlueZ session every cycle and pick a live adapter.
 
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use bluer::{Adapter, AdapterEvent, DiscoveryFilter, DiscoveryTransport, ErrorKind, Session};
+use bluer::{
+    Adapter, AdapterEvent, Address, DiscoveryFilter, DiscoveryTransport, ErrorKind, Session,
+};
 use chrono::Local;
 use futures::{pin_mut, StreamExt};
 use tokio::sync::watch;
@@ -14,8 +20,8 @@ use tokio::time::{timeout, Instant};
 
 use crate::csvlog;
 use crate::protocol::{
-    hex_lower, infer_unit, mfg_matches, name_matches, parse_packet, to_celsius, Packet, TempUnit,
-    NOTIFY_UUID, SERVICE_UUID,
+    hex_lower, infer_unit, mfg_matches, name_matches, parse_packet, to_celsius, NotifyBuf, Packet,
+    TempUnit, NOTIFY_UUID, SERVICE_UUID,
 };
 use crate::state::{AppState, ConnectionStatus, Reading};
 
@@ -24,32 +30,21 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const SERVICES_TIMEOUT: Duration = Duration::from_secs(10);
 const BACKOFF_START: Duration = Duration::from_secs(5);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
+const DEAD_ADAPTER_BACKOFF: Duration = Duration::from_secs(2);
+
+struct LiveAdapter {
+    adapter: Adapter,
+    label: String,
+}
 
 pub async fn run(
     state_tx: watch::Sender<AppState>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let session = Session::new()
-        .await
-        .context("connect to bluetoothd over D-Bus")?;
-    let adapter = session
-        .default_adapter()
-        .await
-        .context("open BlueZ default adapter (hci0 if present)")?;
-    adapter
-        .set_powered(true)
-        .await
-        .context("power on default adapter")?;
-
-    let addr = adapter
-        .address()
-        .await
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| "?".into());
-    tracing::info!("using BlueZ default adapter {} ({})", adapter.name(), addr);
-
     let mut backoff = BACKOFF_START;
+    let mut preferred_mac: Option<Address> = None;
     let mut unit_from_state: Option<TempUnit> = None;
+    let mut last_logged_adapter = String::new();
 
     loop {
         if *shutdown_rx.borrow() {
@@ -58,12 +53,65 @@ pub async fn run(
 
         publish(&state_tx, ConnectionStatus::Scanning, None);
 
-        match run_once(&adapter, &state_tx, &mut shutdown_rx, &mut unit_from_state).await {
-            Ok(CycleOk::Data) => {
+        let adapters = match open_adapters(preferred_mac).await {
+            Ok(a) => a,
+            Err(err) => {
+                tracing::warn!("adapter init failed: {err:#}");
+                publish(
+                    &state_tx,
+                    ConnectionStatus::Error {
+                        detail: compact_error(&err),
+                    },
+                    None,
+                );
+                if wait_backoff(&mut shutdown_rx, backoff).await {
+                    break;
+                }
+                backoff = (backoff * 2).min(BACKOFF_MAX);
+                continue;
+            }
+        };
+
+        let mut outcome: Option<Result<CycleOk>> = None;
+        let mut used_mac: Option<Address> = None;
+        for live in &adapters {
+            if live.label != last_logged_adapter {
+                tracing::info!("using adapter {}", live.label);
+                last_logged_adapter = live.label.clone();
+            }
+            match run_once(
+                &live.adapter,
+                &state_tx,
+                &mut shutdown_rx,
+                &mut unit_from_state,
+            )
+            .await
+            {
+                Ok(cycle) => {
+                    used_mac = live.adapter.address().await.ok();
+                    outcome = Some(Ok(cycle));
+                    break;
+                }
+                Err(err) if try_next_adapter(&err) => {
+                    tracing::info!("{}: {err:#}; trying next adapter", live.label);
+                    outcome = Some(Err(err));
+                }
+                Err(err) => {
+                    outcome = Some(Err(err));
+                    break;
+                }
+            }
+        }
+
+        match outcome {
+            Some(Ok(CycleOk::Data)) => {
+                if used_mac.is_some() {
+                    preferred_mac = used_mac;
+                }
                 backoff = BACKOFF_START;
             }
-            Ok(CycleOk::Stop) => break,
-            Err(err) => {
+            Some(Ok(CycleOk::Stop)) => break,
+            Some(Err(err)) => {
                 tracing::warn!("BLE cycle failed: {err:#}");
                 if !matches_busy_or_status(&state_tx) {
                     publish(
@@ -74,6 +122,20 @@ pub async fn run(
                         None,
                     );
                 }
+                if is_dead_adapter(&err) {
+                    last_logged_adapter.clear();
+                    backoff = DEAD_ADAPTER_BACKOFF;
+                }
+            }
+            None => {
+                tracing::warn!("BLE cycle failed: no usable Bluetooth adapter");
+                publish(
+                    &state_tx,
+                    ConnectionStatus::Error {
+                        detail: "no usable Bluetooth adapter".into(),
+                    },
+                    None,
+                );
             }
         }
 
@@ -82,19 +144,141 @@ pub async fn run(
         }
 
         tracing::info!("retrying in {} s", backoff.as_secs());
-        tokio::select! {
-            _ = tokio::time::sleep(backoff) => {}
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
-                    break;
-                }
-            }
+        if wait_backoff(&mut shutdown_rx, backoff).await {
+            break;
         }
         backoff = (backoff * 2).min(BACKOFF_MAX);
     }
 
     tracing::info!("BLE task stopping");
     Ok(())
+}
+
+/// Re-enumerate adapters every cycle. USB BT dongles change hciN on replug,
+/// and bluer's `default_adapter()` hard-picks `hci0` whenever that name exists.
+async fn open_adapters(preferred_mac: Option<Address>) -> Result<Vec<LiveAdapter>> {
+    let session = Session::new()
+        .await
+        .context("connect to bluetoothd over D-Bus")?;
+    let names = session
+        .adapter_names()
+        .await
+        .context("list Bluetooth adapters")?;
+    if names.is_empty() {
+        return Err(anyhow!("no Bluetooth adapters present"));
+    }
+
+    let ordered = order_adapter_names(&session, names, preferred_mac).await;
+    let mut out = Vec::new();
+    for name in ordered {
+        let adapter = match session.adapter(&name) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::debug!("open {name}: {e}");
+                continue;
+            }
+        };
+        if let Err(e) = adapter.set_powered(true).await {
+            tracing::warn!("power on {name}: {e}");
+            continue;
+        }
+        let addr = adapter
+            .address()
+            .await
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "?".into());
+        out.push(LiveAdapter {
+            adapter,
+            label: format!("{name} ({addr})"),
+        });
+    }
+    if out.is_empty() {
+        return Err(anyhow!("no powered Bluetooth adapters available"));
+    }
+    Ok(out)
+}
+
+async fn order_adapter_names(
+    session: &Session,
+    names: Vec<String>,
+    preferred_mac: Option<Address>,
+) -> Vec<String> {
+    let wanted = std::env::var("INKBIRD_TRAY_ADAPTER")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let mut scored: Vec<(u8, String)> = Vec::new();
+    for name in names {
+        let adapter = match session.adapter(&name) {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        let mac = adapter.address().await.ok();
+        let mut score = 3u8;
+        if let Some(ref wanted) = wanted {
+            if name.eq_ignore_ascii_case(wanted) {
+                score = 0;
+            } else if let (Ok(want_mac), Some(mac)) = (wanted.parse::<Address>(), mac) {
+                if want_mac == mac {
+                    score = 0;
+                }
+            }
+        } else if let (Some(pref), Some(mac)) = (preferred_mac, mac) {
+            if pref == mac {
+                score = 1;
+            }
+        }
+        if score > 1 && adapter_has_cached_iam(&adapter).await {
+            score = 2;
+        }
+        scored.push((score, name));
+    }
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, n)| n).collect()
+}
+
+async fn adapter_has_cached_iam(adapter: &Adapter) -> bool {
+    let Ok(addrs) = adapter.device_addresses().await else {
+        return false;
+    };
+    for addr in addrs {
+        let Ok(dev) = adapter.device(addr) else {
+            continue;
+        };
+        if dev
+            .name()
+            .await
+            .ok()
+            .flatten()
+            .as_deref()
+            .is_some_and(name_matches)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn try_next_adapter(err: &anyhow::Error) -> bool {
+    is_dead_adapter(err) || err.to_string().contains("sensor not found during scan")
+}
+
+fn is_dead_adapter(err: &anyhow::Error) -> bool {
+    let s = err.to_string().to_ascii_lowercase();
+    s.contains("not present or removed")
+        || s.contains("unknown object")
+        || s.contains("resource not ready")
+        || s.contains("no such adapter")
+        || s.contains("does not exist")
+}
+
+/// Returns true if shutdown was requested during the wait.
+async fn wait_backoff(shutdown_rx: &mut watch::Receiver<bool>, backoff: Duration) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(backoff) => false,
+        _ = shutdown_rx.changed() => *shutdown_rx.borrow(),
+    }
 }
 
 async fn run_once(
@@ -199,6 +383,7 @@ async fn run_once(
     tracing::info!("subscribed; waiting for packets (device interval, do not poll)");
 
     let mut saw_data = false;
+    let mut notify_buf = NotifyBuf::default();
 
     loop {
         if *shutdown_rx.borrow() {
@@ -248,14 +433,14 @@ async fn run_once(
                         };
                     }
                     Some(payload) => {
-                        if handle_payload(
-                            &payload,
-                            &address,
-                            state_tx,
-                            unit_from_state,
-                            &mut saw_data,
-                        ) {
-                            // data persisted; keep listening
+                        for frame in notify_buf.feed(&payload) {
+                            handle_payload(
+                                &frame,
+                                &address,
+                                state_tx,
+                                unit_from_state,
+                                &mut saw_data,
+                            );
                         }
                     }
                 }

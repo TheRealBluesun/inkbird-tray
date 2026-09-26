@@ -57,6 +57,53 @@ pub enum Packet {
     Unknown,
 }
 
+/// Reassemble GATT notifies that BlueZ sometimes splits (seen live as a
+/// 15-byte `55 aa 01 …` prefix followed ~20 ms later by the leftover
+/// checksum byte). `feed` returns every complete DATA/STATE frame in the
+/// buffer; leftover prefix bytes stay until the next notify.
+#[derive(Debug, Default)]
+pub struct NotifyBuf {
+    buf: Vec<u8>,
+}
+
+impl NotifyBuf {
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<Vec<u8>> {
+        if chunk.is_empty() {
+            return Vec::new();
+        }
+        self.buf.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        loop {
+            let need = match self.buf.as_slice() {
+                [0x55, 0xaa, 0x01, ..] => 16,
+                [0x55, 0xaa, 0x05, ..] => 12,
+                [] => break,
+                [0x55, 0xaa] => break, // still waiting for the type byte
+                [0x55] => break,
+                _ => {
+                    // Desync: drop until the next 0x55 header.
+                    if let Some(i) = self.buf.iter().position(|&b| b == 0x55) {
+                        if i == 0 {
+                            // 0x55 not followed by 0xaa — skip this byte.
+                            self.buf.drain(..1);
+                            continue;
+                        }
+                        self.buf.drain(..i);
+                        continue;
+                    }
+                    self.buf.clear();
+                    break;
+                }
+            };
+            if self.buf.len() < need {
+                break;
+            }
+            out.push(self.buf.drain(..need).collect());
+        }
+        out
+    }
+}
+
 /// Parse one GATT notification.
 ///
 /// DATA (16 bytes, `55 aa 01 ...`):
@@ -219,6 +266,21 @@ mod tests {
     #[test]
     fn unknown_short_payload() {
         assert_eq!(parse_packet(&[0x00, 0x01]), Packet::Unknown);
+    }
+
+    #[test]
+    fn reassembles_split_data_notify() {
+        let full = decode_hex("55aa01101002b801d601cc03e2010054");
+        assert_eq!(full.len(), 16);
+        let mut buf = NotifyBuf::default();
+        assert!(buf.feed(&full[..15]).is_empty());
+        let frames = buf.feed(&full[15..]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], full);
+        match parse_packet(&frames[0]) {
+            Packet::Data(r) => assert_eq!(r.co2_ppm, 460),
+            other => panic!("expected Data, got {other:?}"),
+        }
     }
 
     #[test]
