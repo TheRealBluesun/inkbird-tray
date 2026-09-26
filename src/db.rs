@@ -23,6 +23,10 @@ CREATE TABLE IF NOT EXISTS readings (
     humidity_pct REAL    NOT NULL,
     pressure_hpa INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS outdoor (
+    ts     INTEGER PRIMARY KEY,
+    temp_c REAL    NOT NULL
+);
 ";
 
 /// One row as the viewer consumes it.
@@ -109,6 +113,51 @@ pub fn append(reading: &Reading) -> Result<()> {
         return Err(e).context("insert reading");
     }
     Ok(())
+}
+
+/// Insert or refresh outdoor temperature samples `(unix_ts, °C)`.
+pub fn upsert_outdoor(samples: &[(i64, f64)]) -> Result<usize> {
+    let mut guard = WRITER.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Some(open()?);
+    }
+    let conn = guard.as_mut().expect("opened above");
+    let res = (|| -> rusqlite::Result<usize> {
+        let tx = conn.transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt =
+                tx.prepare("INSERT OR REPLACE INTO outdoor (ts, temp_c) VALUES (?1, ?2)")?;
+            for &(ts, t) in samples {
+                n += stmt.execute(params![ts, t])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    })();
+    if res.is_err() {
+        *guard = None;
+    }
+    res.context("store outdoor temperature")
+}
+
+/// All outdoor samples, oldest first. Small (hourly), and recent hours get
+/// revised, so the viewer reloads the whole table.
+pub fn load_outdoor(conn: &Connection) -> Result<Vec<(i64, f64)>> {
+    // Older databases opened read-only may predate the table.
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'outdoor')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare_cached("SELECT ts, temp_c FROM outdoor ORDER BY ts")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// Seed an empty database from the legacy CSV log. No-op once any row exists.

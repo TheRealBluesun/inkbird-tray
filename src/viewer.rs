@@ -19,6 +19,8 @@ const POLL: Duration = Duration::from_secs(15);
 /// (sensor off, BLE held by the phone app, daemon stopped).
 const GAP_SECS: f64 = 600.0;
 const MIN_SPAN_SECS: f64 = 600.0;
+/// Outdoor samples are hourly; break the line only when hours are missing.
+const OUTDOOR_GAP_SECS: f64 = 3.0 * 3600.0;
 /// Plot grid_spacing range: lines fade in from MIN to fully opaque at MAX px.
 const GRID_MIN_PX: f32 = 10.0;
 const GRID_MAX_PX: f32 = 30.0;
@@ -52,6 +54,7 @@ mod palette {
     pub const TEMP: Color32 = Color32::from_rgb(0xfb, 0x71, 0x85);
     pub const RH: Color32 = Color32::from_rgb(0x38, 0xbd, 0xf8);
     pub const HPA: Color32 = Color32::from_rgb(0xa7, 0x8b, 0xfa);
+    pub const OUTDOOR: Color32 = Color32::from_rgb(0xb4, 0xbe, 0xcd);
 }
 
 /// Same thresholds as the tray icon: green < 800, amber ≤ 1000, then worse.
@@ -129,6 +132,7 @@ impl Metric {
     fn height_weight(self) -> f32 {
         match self {
             Metric::Co2 => 1.8,
+            Metric::Temp => 1.3,
             _ => 1.0,
         }
     }
@@ -208,6 +212,8 @@ struct Viewer {
     xs: Vec<f64>,
     /// co2, temp_c, rh, hpa — temperature converted at display time.
     ys: [Vec<f64>; 4],
+    /// Outdoor temperature (unix ts, °C), hourly.
+    outdoor: Vec<(f64, f64)>,
     fahrenheit: bool,
     last_ts: i64,
     last_poll: Instant,
@@ -229,6 +235,7 @@ impl Viewer {
             error: None,
             xs: Vec::new(),
             ys: Default::default(),
+            outdoor: Vec::new(),
             fahrenheit: false,
             last_ts: i64::MIN,
             last_poll: Instant::now(),
@@ -264,6 +271,10 @@ impl Viewer {
             }
         };
         self.error = None;
+        match db::load_outdoor(self.conn.as_ref().expect("opened")) {
+            Ok(o) => self.outdoor = o.into_iter().map(|(t, c)| (t as f64, c)).collect(),
+            Err(e) => tracing::warn!("outdoor temperature: {e:#}"),
+        }
         let Some(last) = rows.last() else { return };
         let prev_end = self.xs.last().copied();
         self.fahrenheit = last.fahrenheit;
@@ -288,6 +299,50 @@ impl Viewer {
             Metric::Temp if self.fahrenheit => y * 9.0 / 5.0 + 32.0,
             _ => y,
         }
+    }
+
+    fn to_display_temp(&self, c: f64) -> f64 {
+        if self.fahrenheit {
+            c * 9.0 / 5.0 + 32.0
+        } else {
+            c
+        }
+    }
+
+    /// Outdoor temperature at `x`, linearly interpolated between hourly
+    /// samples, in the display unit.
+    fn outdoor_at(&self, x: f64) -> Option<f64> {
+        let o = &self.outdoor;
+        let i = o.partition_point(|p| p.0 < x);
+        let v = match (i.checked_sub(1).map(|j| o[j]), o.get(i).copied()) {
+            (Some(a), Some(b)) if b.0 - a.0 <= OUTDOOR_GAP_SECS => {
+                let t = if b.0 > a.0 { (x - a.0) / (b.0 - a.0) } else { 0.0 };
+                a.1 + (b.1 - a.1) * t
+            }
+            // Past the newest sample (or before the oldest): hold it for an hour.
+            (Some(a), _) if x - a.0 <= 3600.0 => a.1,
+            (_, Some(b)) if b.0 - x <= 3600.0 => b.1,
+            _ => return None,
+        };
+        Some(self.to_display_temp(v))
+    }
+
+    /// Visible outdoor samples as line segments, split at missing hours.
+    fn outdoor_segments(&self, lo: f64, hi: f64) -> Vec<Vec<[f64; 2]>> {
+        let o = &self.outdoor;
+        let start = o.partition_point(|p| p.0 < lo).saturating_sub(1);
+        let end = (o.partition_point(|p| p.0 <= hi) + 1).min(o.len());
+        let mut segs: Vec<Vec<[f64; 2]>> = Vec::new();
+        for i in start..end {
+            let p = [o[i].0, self.to_display_temp(o[i].1)];
+            match segs.last_mut() {
+                Some(seg) if p[0] - seg.last().expect("non-empty")[0] <= OUTDOOR_GAP_SECS => {
+                    seg.push(p)
+                }
+                _ => segs.push(vec![p]),
+            }
+        }
+        segs
     }
 
     fn data_extent(&self) -> Option<(f64, f64)> {
@@ -494,6 +549,19 @@ impl Viewer {
                             .size(14.0)
                             .color(palette::MUTED),
                     );
+                    let outside = match (m, shown) {
+                        (Metric::Temp, Some(i)) => self.outdoor_at(self.xs[i]),
+                        _ => None,
+                    };
+                    if let Some(o) = outside {
+                        ui.add_space(10.0);
+                        dot(ui, palette::OUTDOOR);
+                        ui.label(
+                            RichText::new(format!("outside {o:.0}{}", m.unit(self.fahrenheit)))
+                                .size(13.0)
+                                .color(palette::OUTDOOR),
+                        );
+                    }
                 });
                 let summary = match self.stats(m, visible) {
                     Some((mn, avg, mx)) => {
@@ -571,9 +639,14 @@ impl Viewer {
                 let b = pui.plot_bounds();
                 let (lo, hi) = (b.min()[0], b.max()[0]);
                 let segs = self.decimate(m, lo, hi, buckets);
+                let outdoor = if m == Metric::Temp {
+                    self.outdoor_segments(lo, hi)
+                } else {
+                    Vec::new()
+                };
 
                 let (mut ymin, mut ymax) = (f64::INFINITY, f64::NEG_INFINITY);
-                for p in segs.iter().flatten() {
+                for p in segs.iter().flatten().chain(outdoor.iter().flatten()) {
                     ymin = ymin.min(p[1]);
                     ymax = ymax.max(p[1]);
                 }
@@ -618,6 +691,16 @@ impl Viewer {
                     pui.line(line);
                 }
 
+                for seg in outdoor {
+                    pui.line(
+                        Line::new("outside", PlotPoints::new(seg))
+                            .color(palette::OUTDOOR.gamma_multiply(0.85))
+                            .width(1.4)
+                            .style(egui_plot::LineStyle::Dashed { length: 6.0 })
+                            .allow_hover(false),
+                    );
+                }
+
                 if let Some(i) = hover_idx {
                     let x = self.xs[i];
                     let y = self.value(m, i);
@@ -635,6 +718,15 @@ impl Viewer {
                             .filled(true)
                             .allow_hover(false),
                     );
+                    if let Some(o) = (m == Metric::Temp).then(|| self.outdoor_at(x)).flatten() {
+                        pui.points(
+                            Points::new("", vec![[x, o]])
+                                .radius(3.5)
+                                .color(palette::OUTDOOR)
+                                .filled(true)
+                                .allow_hover(false),
+                        );
+                    }
                 }
 
                 let hover = pui
@@ -657,12 +749,18 @@ impl Viewer {
                 interacted = true;
             }
             if let Some(i) = hover_idx.filter(|_| hover.is_some()) {
+                let outside = (m == Metric::Temp)
+                    .then(|| self.outdoor_at(self.xs[i]))
+                    .flatten()
+                    .map(|o| format!("\noutside {o:.1} {unit}"))
+                    .unwrap_or_default();
                 resp.response.on_hover_text_at_pointer(format!(
-                    "{}\n{:.*} {}",
+                    "{}\n{:.*} {}{}",
                     fmt_ts(self.xs[i], "%a %-d %b  %H:%M"),
                     decimals,
                     self.value(m, i),
-                    unit
+                    unit,
+                    outside
                 ));
             }
             if !last {

@@ -12,6 +12,7 @@ mod protocol;
 mod state;
 mod tray;
 mod viewer;
+mod weather;
 
 /// Floor for the stale window (seconds). A reading older than the effective
 /// window (this floor, widened adaptively once the device rhythm is known —
@@ -70,6 +71,8 @@ async fn daemon() -> anyhow::Result<()> {
             tracing::error!("BLE task exited: {e:#}");
         }
     });
+
+    tokio::spawn(weather::run(shutdown_rx.clone()));
 
     let tray_shutdown = shutdown_rx.clone();
     let mut action_rx = tray::spawn_tray(state_rx, tray_shutdown).await;

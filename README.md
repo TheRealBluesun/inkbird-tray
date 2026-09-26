@@ -162,6 +162,24 @@ and polls for new rows every 15 s; clicking again raises the open window
   outages show as gaps. Long ranges are reduced to a min/max pair per pixel
   column, which keeps spikes.
 
+### Outdoor temperature
+
+Set `INKBIRD_TRAY_LATLON=lat,lon` and the daemon pulls hourly outdoor
+temperature from [Open-Meteo](https://open-meteo.com/) (free, no API key)
+into an `outdoor(ts, temp_c)` table: ~3 months of backfill at start, then the
+last two days every 30 min, since the model revises recent hours. The history
+window draws it as a dashed line on the temperature plot. Keep the location
+out of the repo with a systemd drop-in:
+
+```ini
+# ~/.config/systemd/user/inkbird-tray.service.d/location.conf
+[Service]
+Environment=INKBIRD_TRAY_LATLON=40.7128,-74.0060
+```
+
+Look up coordinates for a ZIP or city with
+`curl "https://geocoding-api.open-meteo.com/v1/search?name=<zip or city>&country=US"`.
+
 ### The icon IS the reading (pixmap digits)
 
 When a reading exists, `icon_name` is blanked and `icon_pixmap` carries the
@@ -263,5 +281,6 @@ src/state.rs      watch-channel snapshot
 src/csvlog.rs     ~/.local/share/inkbird-tray/readings.csv
 src/db.rs         ~/.local/share/inkbird-tray/readings.db (SQLite)
 src/viewer.rs     history window (inkbird-tray --viewer)
+src/weather.rs    Open-Meteo outdoor temperature (INKBIRD_TRAY_LATLON)
 inkbird-tray.service
 ```
